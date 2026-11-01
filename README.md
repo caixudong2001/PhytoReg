@@ -14,7 +14,15 @@ Python 3.10+, PyTorch and NumPy are required. The package provides one model cla
 
 ## Load and predict
 
-The trained model bundle is supplied separately and is not included in this code repository. Place it in `weights/PhytoReg/`, then:
+The trained model bundle is supplied separately. Place its five files in `weights/PhytoReg/`. For FASTA/BED input, automatic windowing, batched prediction and genomic-coordinate output:
+
+```bash
+phytoreg predict weights/PhytoReg --fasta genome.fa --bed regions.bed --species arabidopsis_thaliana --task Histone --output predictions --batch-size 1 --format both --device cuda
+```
+
+Omit `--bed` to cover the entire FASTA. Results include compressed coordinate tables, per-track bedGraph files and complete-window totals. The [inference guide](docs/inference.md) includes a runnable example, track selection, masks, units and output schemas.
+
+For direct Python inference:
 
 ```python
 import torch
@@ -47,6 +55,7 @@ with torch.inference_mode():
 
 ```bash
 phytoreg inspect weights/PhytoReg
+phytoreg tracks weights/PhytoReg --species arabidopsis_thaliana --output tracks.tsv
 phytoreg predict weights/PhytoReg --input inputs.npz --output predictions.npz --device cuda
 ```
 

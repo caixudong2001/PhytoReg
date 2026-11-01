@@ -1,0 +1,4 @@
+chrA	33	256	first	0	+
+chrA	128	320	overlap	0	-
+chrA	4000	4096	boundary	0	.
+chrB	32	96	second	0	+
