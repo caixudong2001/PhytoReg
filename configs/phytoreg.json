@@ -1,0 +1,35 @@
+{
+  "backbone": {
+    "input_length_bp": 131072,
+    "downstream_output_length_bp": 65536,
+    "token_embed_dim": 16,
+    "conv_init_embed_dim": 512,
+    "encoder_channels": [
+      585,
+      658,
+      731,
+      804,
+      878,
+      951,
+      1024
+    ],
+    "transformer_dim": 1024,
+    "transformer_layers": 9,
+    "transformer_heads": 16,
+    "transformer_ffn_dim": 4096,
+    "transformer_dropout": 0.0,
+    "attention_dropout": 0.0,
+    "rotary_theta": 10000.0,
+    "use_skip_connection": true,
+    "gradient_checkpointing": true
+  },
+  "head": {
+    "hidden_dim": 512,
+    "output_dim": 256,
+    "num_tracks": 1356,
+    "registry_size": 1572,
+    "num_species": 37,
+    "eps": 1e-05
+  },
+  "region_total_length": true
+}
