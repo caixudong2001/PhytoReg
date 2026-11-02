@@ -1,0 +1,39 @@
+name: Test and package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU runtime and build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install build
+          python -m pip install -e '.[dev]'
+      - name: Behavioral tests
+        run: python -m unittest discover -s tests -v
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check installed wheel outside source tree
+        run: |
+          python -m pip uninstall -y phytoreg
+          python -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -c "import phytoreg; assert phytoreg.__version__ == '0.2.0'; assert phytoreg.PhytoReg.model_name == 'PhytoReg'"
+          phytoreg --help

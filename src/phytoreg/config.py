@@ -84,10 +84,24 @@ class HeadConfig:
 
 
 @dataclass(frozen=True)
+class SpatialConfig:
+    width: int = 64
+    context_width: int = 16
+    num_conditions: int = 52
+
+    def __post_init__(self):
+        for name in ('width', 'context_width', 'num_conditions'):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f'{name} must be a positive integer')
+
+
+@dataclass(frozen=True)
 class PhytoRegConfig:
     backbone: BackboneConfig
     head: HeadConfig
     region_total_length: bool = True
+    spatial: SpatialConfig = SpatialConfig()
 
     def __post_init__(self):
         self.backbone.validate()
@@ -102,9 +116,9 @@ class PhytoRegConfig:
     @classmethod
     def from_dict(cls, value):
         if set(value) != {f.name for f in fields(cls)}:
-            raise ValueError('Expected backbone, head and region_total_length configuration')
+            raise ValueError('Expected backbone, head, spatial and region_total_length configuration')
         return cls(BackboneConfig.from_dict(value['backbone']), HeadConfig(**value['head']),
-                   value['region_total_length'])
+                   value['region_total_length'], SpatialConfig(**value['spatial']))
 
     @classmethod
     def from_json(cls, path):

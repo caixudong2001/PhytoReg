@@ -17,7 +17,7 @@ def _positive(value):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='phytoreg', description='PhytoReg independent regulatory model')
+    parser = argparse.ArgumentParser(prog='phytoreg', description='PhytoReg two-stage regulatory model')
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('inspect', 'tracks', 'predict'):
         command = commands.add_parser(name)
@@ -32,7 +32,7 @@ def main(argv=None):
             source.add_argument('--input', type=Path, help='NPZ with dna and track_indices')
             source.add_argument('--fasta', type=Path, help='Reference FASTA or FASTA.gz')
             command.add_argument('--bed', type=Path, help='BED3-6 requested regions; default: entire FASTA')
-            command.add_argument('--valid-bed', type=Path, help='BED3-6 defining valid positions for profile/total')
+            command.add_argument('--valid-bed', type=Path, help='BED3-6 defining peak context and profile/total positions')
             selection = command.add_mutually_exclusive_group()
             selection.add_argument('--track-id', action='append', help='Track ID to predict; repeat for multiple tracks')
             selection.add_argument('--tracks-file', type=Path, help='One track ID per line')
@@ -60,7 +60,8 @@ def main(argv=None):
             latest_full_validation_step=model.metadata.get('latest_full_validation_step'),
             parameter_count=sum(p.numel() for p in model.parameters()),
             trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad),
-            head=asdict(model.config.head),
+            architecture='shared-spatial-task-readout', stages=2,
+            head=asdict(model.config.head), spatial=asdict(model.config.spatial),
             species=sorted({r['species_id'] for r in model.track_catalog}),
             weights_sha256=model.metadata['loaded_weights_sha256']), ensure_ascii=False, indent=2))
         return

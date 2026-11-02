@@ -1,6 +1,8 @@
 # PhytoReg
 
-PhytoReg predicts plant regulatory activity from DNA across 37 species and 1,356 experimental tracks. It uses a shared sequence backbone and independent signal, peak, profile and total readouts. The model has approximately 205 million parameters.
+PhytoReg is a two-stage plant regulatory model with a **shared spatial pathway and task-adaptive readouts**. It predicts signal, peaks, positional profiles and window totals across 37 species and 1,356 experimental tracks.
+
+The first stage encodes DNA and estimates regulatory activity. The second stage combines these predictions with spatial context and frozen sequence features. Histone, OCR and TF share the spatial pathway and have task-specific readouts. `peak_logits` is the complete model's final peak prediction.
 
 ## Install
 
@@ -10,19 +12,17 @@ cd PhytoReg
 python -m pip install .
 ```
 
-Python 3.10+, PyTorch and NumPy are required. The package provides one model class, `PhytoReg`, and one model bundle format, `PhytoReg`.
+Python 3.10+, PyTorch and NumPy are required.
 
-## Load and predict
+## Model weights
 
-The trained model bundle is supplied separately. Place its five files in `weights/PhytoReg/`. For FASTA/BED input, automatic windowing, batched prediction and genomic-coordinate output:
+Place a complete trained two-stage bundle in `weights/PhytoReg/`. It contains `model.pt`, `config.json`, `tracks.json`, `metadata.json` and `manifest.json`. Both stages are loaded from this one directory; loading verifies all checksums.
 
 ```bash
-phytoreg predict weights/PhytoReg --fasta genome.fa --bed regions.bed --species arabidopsis_thaliana --task Histone --output predictions --batch-size 1 --format both --device cuda
+phytoreg inspect weights/PhytoReg
 ```
 
-Omit `--bed` to cover the entire FASTA. Results include compressed coordinate tables, per-track bedGraph files and complete-window totals. The [inference guide](docs/inference.md) includes a runnable example, track selection, masks, units and output schemas.
-
-For direct Python inference:
+## Python inference
 
 ```python
 import torch
@@ -31,39 +31,39 @@ from phytoreg import PhytoReg
 model = PhytoReg.from_pretrained('weights/PhytoReg', device='cuda')
 tracks = model.tracks_for('arabidopsis_thaliana', task='Histone')[None]
 
-# dna: int64 [batch, 131072], A/C/G/T/N = 0/1/2/3/4
-# region: bool [batch, 2048], positions included in profile/total readouts
+# dna: int64 [B,131072], A/C/G/T/N = 0/1/2/3/4
+# region: known inference-time bool mask [B,2048], independent of labels
 with torch.inference_mode():
     outputs = model(dna, tracks, position_valid_mask=region)
 ```
 
-`dna`, `tracks` and masks must be on the model's device. One-hot DNA `[B,131072,5]` is also accepted. The central 65,536 bp is predicted at 32-bp resolution, giving 2,048 output bins. The model uses registry indices returned by `tracks_for`; each sequence's selected tracks belong to one species. A batch can contain different species with padded track lists.
+DNA, tracks and masks must be on the model's device. One-hot DNA `[B,131072,5]` is also accepted. Predictions cover the central 65,536 bp in 2,048 bins of 32 bp. A batch can contain different species using padded track lists; each sequence's active tracks belong to one species.
 
 | Output | Shape | Meaning |
 |---|---|---|
-| `signal_z` | `[B,2048,K]` | Continuous signal in TRAIN-standardized units |
-| `peak_logits` | `[B,2048,K]` | Peak classification logits; apply sigmoid for probabilities |
+| `signal_z` | `[B,2048,K]` | TRAIN-standardized continuous signal |
+| `peak_logits` | `[B,2048,K]` | Final shared-spatial, task-adaptive peak logits |
 | `profile_logits` | `[B,2048,K]` | Position logits for the signal distribution |
 | `total_z` | `[B,K]` | Predicted log1p window total |
-| `profile_score` | `[B,2048,K]` | Stabilized, unnormalized profile scores; invalid positions are zero |
+| `profile_score` | `[B,2048,K]` | Stabilized, unnormalized profile scores |
 
-`model.signal_in_registry_space(outputs['signal_z'], tracks)` reverses TRAIN standardization. Registry-level normalization remains; its per-track transform, center, scale and clipping bounds are described in `tracks.json`. This output should not be interpreted directly as raw coverage.
+Apply sigmoid to `peak_logits` to obtain peak scores in `[0,1]`. `model.signal_in_registry_space(outputs['signal_z'], tracks)` reverses TRAIN standardization while retaining the registry's original transform and normalization.
 
-`position_valid_mask` selects positions for total pooling and profile normalization. Omitting it uses all positions. The released model was trained/evaluated with the recorded noncoding/valid-region mask; use the same mask to reproduce that evaluation. The mask does not modify DNA backbone features. `track_valid_mask` handles padding in `[B,K]` track indices.
+`position_valid_mask` supplies known genomic support for spatial context, profile normalization and total pooling. Omitting it uses every output position.
 
 ## Command line
 
 ```bash
-phytoreg inspect weights/PhytoReg
-phytoreg tracks weights/PhytoReg --species arabidopsis_thaliana --output tracks.tsv
+phytoreg predict weights/PhytoReg --fasta genome.fa --bed regions.bed --species arabidopsis_thaliana --task Histone --output predictions --batch-size 1 --format both --device cuda
 phytoreg predict weights/PhytoReg --input inputs.npz --output predictions.npz --device cuda
+phytoreg tracks weights/PhytoReg --species arabidopsis_thaliana --output tracks.tsv
 ```
 
-The NPZ input contains `dna`, `track_indices`, and optionally `track_valid_mask` and `position_valid_mask`. Existing prediction files are not overwritten. Bundle checksums are verified on every load.
+Every command loads the complete model. FASTA output includes coordinate tables, per-track bedGraph and whole-window totals. NPZ input contains `dna`, `track_indices`, and optional `track_valid_mask` and `position_valid_mask`. Output paths must be new. See the [inference guide](docs/inference.md) for examples, coordinates, masks and units.
 
-## Model bundle
+## Complete model bundle
 
-```
+```text
 weights/PhytoReg/
   model.pt
   config.json
@@ -72,6 +72,6 @@ weights/PhytoReg/
   manifest.json
 ```
 
-The bundle contains the complete backbone, four output heads and normalization buffers. Loading requires only this package and bundle. `model.train()` enables training of the backbone and heads; `model.save_pretrained('new_directory')` writes the same format without optimizer state.
+`model.pt` includes both stages, all fixed context parameters and normalization buffers. Loading requires only this package and the five-file bundle. `model.train()` trains the spatial/task readout while keeping the first stage frozen and in evaluation mode. `model.save_pretrained('new_directory')` saves the complete model without optimizer state.
 
-See [architecture and API](docs/architecture.md), [model card](MODEL_CARD.md), and [contributing](CONTRIBUTING.md). Source code is distributed under the [MIT License](LICENSE).
+See the [model description](MODEL_CARD.md), [architecture and API](docs/architecture.md), and [contributing](CONTRIBUTING.md). Code is distributed under the [MIT License](LICENSE).

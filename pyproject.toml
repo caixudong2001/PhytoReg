@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phytoreg"
-dynamic = ["version"]
-description = "Multi-species DNA regulatory model with independent track readouts"
+version = "0.2.0"
+description = "Two-stage plant regulatory model with a shared spatial pathway and task-adaptive readouts"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"

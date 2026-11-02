@@ -1,29 +1,31 @@
-# PhytoReg model card
+# PhytoReg model
 
-## Model
+PhytoReg is a two-stage plant regulatory model with a shared spatial pathway and task-adaptive readouts. It predicts continuous signal, peaks, positional profiles and window totals for Histone, open chromatin (OCR) and transcription-factor (TF) tracks.
 
-PhytoReg is a multi-species plant regulatory model with a shared DNA backbone and four independent track readouts: continuous signal, peak classification, positional profile and window total. It supports 37 species and 1,356 experimental tracks: Histone 724, OCR 301 and TF 331. TF tracks cover Arabidopsis thaliana and Oryza sativa.
+## Architecture
 
-The model has 204,779,587 parameters. Standard input is 131,072 bp; prediction covers the central 65,536 bp at 32-bp resolution. The full species and track identities are included in the model bundle.
+The first stage uses a convolutional/Transformer DNA backbone to produce sequence features and regulatory activity estimates. Signal, initial peak, profile and total have independent per-track readouts.
 
-## Parameters and training
+The second stage combines initial peak logits and continuous signal through shared multiscale spatial filters. Assay-condition gates select spatial scales, and task-specific readouts produce the final peak logits. The TF readout also uses frozen sequence features. Context priors, calibration coefficients and normalization buffers are included in the complete model.
 
-The released parameter set is the retained 2,100-step checkpoint from a full-backbone and independent-readout continuation experiment. The underlying backbone had previous supervised training; this is not a model trained from random initialization in only 2,100 steps. The continuation used seed 17, 2,000 training windows per species, effective batch 48, and trained the backbone and readouts together. Training was stopped by the author.
+The first-stage backbone and activity heads remain frozen during second-stage training. The shared spatial pathway and task-adaptive feature readout are trainable.
 
-Packaging as PhytoReg changes the model format and public API, with no additional training. The tensor values are preserved. No language-model output head or track-query generator is used at inference.
+## Inputs and outputs
 
-## Evaluation scope
+The model supports 37 species and 1,356 experimental tracks. It reads 131,072 bp and predicts the central 65,536 bp in 2,048 bins of 32 bp.
 
-The last completed full 37-species benchmark belongs to step 2,000. Its scores must not be presented as a new benchmark of the released 2,100-step checkpoint. Signal Pearson and peak average precision are separate metrics and must be reported separately. Species-averaged gains do not imply improvement of every track or every species.
+Inputs are DNA, registry track indices and optional position/track masks. The model returns `signal_z`, `peak_logits`, `profile_logits`, `profile_score` and `total_z`. `peak_logits` contains the final two-stage prediction.
 
-Verification found exact equality of all 235 parameter/buffer tensors, all five returned outputs and feature gradients over all 37 species, and native DNA inference for Arabidopsis, rice and grape. Maximum absolute differences were zero. This checks the correctness of packaging; it does not establish performance on an external dataset.
+## Python interface
 
-## Intended use and limitations
+The `PhytoReg` class loads both stages from one model directory:
 
-Use the model for plant regulatory sequence research on the listed species and measured track definitions. Independent output tables cannot generate a new assay/tissue track from metadata. Extrapolation to unrepresented species or experimental conditions requires separate validation.
+```python
+from phytoreg import PhytoReg
 
-The model's signal units are transformed and standardized. Peak probabilities are scores, not experimentally calibrated binding probabilities. Position masks and track-specific valid labels affect comparisons. The reference evaluation uses noncoding/valid-region masks for profile/total outputs and supervision; applying all-position masks changes those outputs.
+model = PhytoReg.from_pretrained('weights/PhytoReg', device='cuda')
+```
 
-## Release information
+The complete bundle contains `model.pt`, `config.json`, `tracks.json`, `metadata.json` and `manifest.json`.
 
-Source code is available in the [PhytoReg repository](https://github.com/caixudong2001/PhytoReg) under the [MIT License](LICENSE). The repository contains code, configuration and tests; trained weights and training data are distributed separately. Their availability and redistribution terms are not established by this code repository.
+See [architecture and API](docs/architecture.md) and the [inference guide](docs/inference.md). Code is distributed under the [MIT License](LICENSE).

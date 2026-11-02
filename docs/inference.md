@@ -8,7 +8,7 @@ cd PhytoReg
 python -m pip install .
 ```
 
-The trained bundle is supplied separately from the code repository. Put `model.pt`, `config.json`, `tracks.json`, `metadata.json` and `manifest.json` in `weights/PhytoReg/`. A configuration file alone does not contain learned parameters. Every load verifies all bundle checksums.
+Use a complete trained two-stage bundle. Put `model.pt`, `config.json`, `tracks.json`, `metadata.json` and `manifest.json` in `weights/PhytoReg/`. The weight file contains both stages, including fixed context priors and task-adaptive readouts. Every load verifies all bundle checksums.
 
 ```bash
 phytoreg inspect weights/PhytoReg
@@ -19,10 +19,10 @@ phytoreg tracks weights/PhytoReg --species arabidopsis_thaliana --output tracks.
 
 ## Run the included example
 
-The small **synthetic** FASTA/BED examples exercise the workflow. Predictions on these artificial sequences are not biological validation results.
+The included FASTA/BED files demonstrate the inference workflow.
 
 ```bash
-phytoreg predict weights/PhytoReg --fasta examples/reference.fa --bed examples/regions.bed --species arabidopsis_thaliana --track-id arabidopsis_thaliana_0000 --output example_predictions --batch-size 1 --format both --device cpu
+phytoreg predict weights/PhytoReg --fasta examples/reference.fa --bed examples/regions.bed --species arabidopsis_thaliana --track-id arabidopsis_thaliana_0014 --output example_predictions --batch-size 1 --format both --device cpu
 ```
 
 Use `--device cuda` or `--device cuda:0` for a GPU. Default device is CPU, default batch size is 1, and computation is FP32. The output directory must not exist.
@@ -61,13 +61,14 @@ Results use FASTA contig names and zero-based, half-open coordinates, in FASTA c
 
 By default, profile and total include bins overlapping real reference, excluding wholly padded output bins. Actual N bases remain valid positions.
 
-`--valid-bed valid_regions.bed` optionally defines allowed profile/total positions. A bin is valid when all its real bases are covered by the union of valid intervals. This mask applies to the **complete model output window**, independently of the BED subset selected for reporting. Use an appropriate noncoding/valid-region mask to reproduce the reference evaluation. This option does not change backbone, signal or peak predictions.
+`--valid-bed valid_regions.bed` optionally defines allowed spatial-context and profile/total positions. A bin is valid when all its real bases are covered by the union of valid intervals. This mask applies to the **complete model output window**, independently of the BED subset selected for reporting. Backbone features and continuous signal are unaffected. Spatial peak context uses this support; outside it, peaks retain their first-stage value.
 
 - `signal_z`: TRAIN-standardized continuous signal.
-- `signal_registry`: reverses TRAIN standardization; original registry transform/normalization remains. This is not raw coverage. Definitions are in the bundle's `tracks.json`.
-- `peak_probability`: sigmoid of `peak_logit`.
+- `signal_registry`: reverses TRAIN standardization; original registry transform/normalization remains. Definitions are in the bundle's `tracks.json`.
+- `peak_logit`: final two-stage shared-spatial, task-adaptive peak score.
+- `peak_probability`: sigmoid of the final `peak_logit`.
 - `profile_probability`: profile scores normalized over **all valid bins of the complete output window**; zero at invalid positions. A reported BED subset need not sum to one.
-- `total_z`: log1p total for the **complete model output window** under its validity mask, not the total for a smaller BED feature. All-invalid windows report `NA` totals and zero profile probabilities.
+- `total_z`: log1p total for the **complete model output window** under its validity mask. All-invalid windows report `NA` totals and zero profile probabilities.
 
 ## Output files
 

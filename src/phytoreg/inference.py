@@ -79,6 +79,7 @@ def predict_genome(model, *, fasta, output, species, bed=None, valid_bed=None, t
             bed_selection='emit complete 32-bp bins intersecting the union of requested intervals; clip at contig end',
             position_mask='bins fully covered by valid_bed' if valid_bed else 'bins overlapping real reference sequence',
             profile_normalization='all valid positions of each complete model output window',
+            peak_readout='shared spatial pathway and task-adaptive readouts over known valid positions',
             signal_units='TRAIN-standardized and registry-normalized; not raw coverage',
             total_units='log1p total per complete model output window',
             ambiguous_iupac_bases_mapped_to_N=reference.ambiguous_bases,

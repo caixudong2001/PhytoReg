@@ -1,33 +1,51 @@
 # Architecture and API
 
-## Sequence backbone
+## Stage one: sequence and regulatory activity
 
-The NTv3-style PyTorch backbone embeds DNA bases, applies seven convolutional downsampling stages, nine RoPE/SwiGLU transformer layers, and a U-Net decoder. It averages full-resolution features into 32-bp bins and retains the central 65,536 bp. Each output position has 512 features. The backbone retains standard self-attention Q/K/V operations.
+The DNA backbone embeds bases, applies seven convolutional downsampling stages, nine RoPE/SwiGLU transformer layers and a U-Net decoder. It averages features into 32-bp bins and retains the central 65,536 bp, with 512 features per position.
 
-## Independent readouts
+Signal, initial peak, profile and total have independent LayerNorm/512-to-256 projections and per-track weight tables. Initial peaks supply the second stage internally. Signal combines two affine terms including species-specific feature normalization and per-track scale. TRAIN label normalization is stored in buffers.
 
-Each of the four tasks has a separate LayerNorm and 512→256 projection. Each registered track has a directly learned 256-dimensional weight vector and bias for each readout. Track IDs index these parameter tables. No metadata encoder, generated track query, track-query attention, or language-model output head is instantiated.
+Total uses masked mean sequence features and a learned log1p valid-length term. Profile scores exponentiate logits after subtracting the maximum over valid positions. Normalize their sum for a positional distribution; an empty region gives zero scores.
 
-The signal head has two learned affine terms sharing its projection. One uses species-normalized features and a per-track scale. Both terms are part of this model's signal readout. The stored feature normalization and TRAIN label normalization are buffers. Their order is retained in FP32 so the released parameters preserve their numerical predictions.
+## Stage two: shared spatial pathway and task-adaptive readout
 
-Peak and profile are independent position-wise logits. Total uses the masked mean of backbone features, its own projection/readout, and a learned log1p valid-length term. Profile scores use exponentiation after subtracting the per-track maximum over valid positions. Normalize their sum to obtain a position distribution when at least one position is valid; an empty mask gives all-zero scores.
+Inputs are first-stage peak logits and standardized signal. Fixed local features use mask-normalized means over 3, 9 and 33 bins. A shared 1-by-1 stem feeds four branches with dilation 1, 4, 16 and 64, local pooling and symmetric five-tap kernels. A shared mixing layer combines central and contextual features. The released pathway width is 64.
 
-The output tables cover a fixed set of experimental tracks. Metadata cannot generate outputs for an unregistered track. Within one sequence, requested tracks must share a species normalization group.
+Known assay-condition embeddings gate spatial scales. Histone, OCR and TF each have spatial readout weights, a bias and a central-input term. TF also uses a LayerNorm/512-to-256 feature projection and registered-track readout over frozen sequence features. Peak-unavailable tracks retain their first-stage peak output.
+
+Fixed learned context pathways and feature references define residual priors and calibration. Their parameters and coefficients are part of the complete model. There is one trainable shared spatial pathway and one task-adaptive feature readout; inference loads no external reference model or fitting artifact.
+
+The final prediction is `peak_logits`. Signal, profile and total come from the frozen first stage. Spatial support uses known inference regions and track availability, independently of observed labels. Invalid spatial positions retain first-stage peak values; padded tracks are zero.
 
 ## Input contract
 
-- DNA is an integer tensor `[B,input_length_bp]` with A/C/G/T/N encoded as 0/1/2/3/4, or one-hot `[B,input_length_bp,5]`. In one-hot input, an all-zero base is a dynamic masked token and is distinct from N.
-- `track_indices` is int64 `[B,K]`. Registry indices may contain gaps and differ from contiguous head rows. Use `tracks_for(species, task)` or `tracks.json`.
-- `track_valid_mask` is boolean `[B,K]`. Omitted masks mark nonnegative indices as active. Masked padding does not contribute to outputs.
-- `position_valid_mask` is boolean `[B,L]`. It controls profile support and total pooling, not backbone feature extraction or signal/peak validity. Downstream metrics still need their label-specific validity masks.
-- `from_features(h, track_indices, ...)` accepts float features `[B,L,512]` with the same readout masks.
+- DNA is integer `[B,input_length_bp]`, A/C/G/T/N = 0/1/2/3/4, or one-hot `[B,input_length_bp,5]`. An all-zero one-hot base is a masked token, distinct from N.
+- `track_indices` is int64 `[B,K]`. Use registry indices from `tracks_for(species, task)` or `tracks.json`, including noncontiguous values.
+- `track_valid_mask` is boolean `[B,K]`. Omitted masks mark nonnegative indices active. Explicitly masked entries can use arbitrary padding sentinels.
+- Each sequence's active tracks share one species normalization group; batch rows can contain different species.
+- `position_valid_mask` is boolean `[B,L]`, controlling spatial context, profile support and total pooling. It does not change DNA encoding or continuous signal.
+- `from_features(h, track_indices, ...)` accepts float `[B,L,512]` and executes both readout stages. Features are detached for second-stage fitting.
 
-## Configuration and checkpoints
+Inference masks describe known regions. Label-specific validity masks belong in losses and metrics, not in model inputs.
 
-`PhytoRegConfig` contains only the sequence backbone, independent heads and valid-length term. Shape validation rejects invalid widths and bin boundaries. `configs/phytoreg.json` describes the full released model.
+## Configuration and complete weights
 
-The on-disk format is `PhytoReg`. `model.pt` contains a tensor state dictionary, `config.json` its architecture, `tracks.json` its track catalog, and `metadata.json` its model-level description. The manifest identifies the format and SHA256 of each file. Loading uses PyTorch's restricted tensor loader and strict state-key matching.
+`PhytoRegConfig` contains `backbone`, `head`, `spatial` and `region_total_length`. `SpatialConfig` specifies shared-pathway width, fixed-context width and the number of assay conditions. `configs/phytoreg.json` describes the released architecture.
 
-The model remains trainable through standard PyTorch. Keep parameters in FP32; an external autocast context may accelerate the backbone while readouts run in FP32. The release includes inference weights, not optimizer or random-generator state for an exact training resume.
+The five-file `PhytoReg` bundle contains `model.pt`, `config.json`, `tracks.json`, `metadata.json` and `manifest.json`. The tensor state dictionary includes both stages, fixed context parameters, registry mappings and normalization buffers. The catalog binds each track to its species, task, condition and availability. Loading verifies SHA256 checksums, catalog mappings and strict state keys.
 
-For deterministic FP32 reproduction on CUDA, set `CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA initialization, disable TF32 and cuDNN benchmarking, set cuDNN deterministic mode, and enable `torch.use_deterministic_algorithms(True)`. Cross-device or reduced-precision arithmetic need not be bitwise identical.
+```python
+from phytoreg import PhytoReg
+
+model = PhytoReg.from_pretrained('weights/PhytoReg', device='cuda')
+model.save_pretrained('new_directory')
+```
+
+The destination must not exist. Saving includes both stages and excludes optimizer state.
+
+## Training and precision
+
+`model.train()` enables shared spatial and task-adaptive feature readouts. The backbone, first-stage heads, fixed context pathways and references retain frozen parameters and evaluation-mode statistics. Use a peak loss and an optimizer over parameters with `requires_grad=True`; signal/profile/total are preserved during updates.
+
+Model parameters and readouts use FP32.

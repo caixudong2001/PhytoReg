@@ -31,5 +31,10 @@
     "num_species": 37,
     "eps": 1e-05
   },
-  "region_total_length": true
+  "region_total_length": true,
+  "spatial": {
+    "width": 64,
+    "context_width": 16,
+    "num_conditions": 52
+  }
 }

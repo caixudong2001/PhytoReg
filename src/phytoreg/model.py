@@ -1,4 +1,4 @@
-"""The trainable PhytoReg model, independent of historical experiment packages."""
+"""PhytoReg: frozen sequence representation and a task-adaptive spatial readout."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from .backbone import NTv3Backbone
 from .config import BackboneConfig, HeadConfig, PhytoRegConfig
 from .heads import IndependentReadouts
+from .spatial import PeakDecoder, TASKS
 
 FORMAT = 'PhytoReg'
 
@@ -26,14 +27,14 @@ def file_sha256(path):
 
 
 class PhytoReg(nn.Module):
-    """NTv3 backbone and four independent outputs for a fixed track registry.
+    """Two-stage DNA regulatory model for a fixed experimental track registry.
 
     Tracks use registry indices, not contiguous head rows. A batch may mix
     species, but each sequence's selected tracks must belong to one species.
     """
     model_name = 'PhytoReg'
 
-    def __init__(self, config: PhytoRegConfig, registry_indices, normalization_groups):
+    def __init__(self, config: PhytoRegConfig, registry_indices, normalization_groups, *, track_catalog):
         super().__init__()
         self.config = config
         self.backbone = NTv3Backbone(config.backbone)
@@ -56,11 +57,31 @@ class PhytoReg(nn.Module):
         if self.region_total_length is not None:
             nn.init.ones_(self.region_total_length.weight)
         self.metadata = {}
-        self.track_catalog = []
+        self.track_catalog = [dict(row) for row in track_catalog]
+        self.peak_decoder = PeakDecoder(config, self.track_catalog)
+        self.backbone.requires_grad_(False)
+        self.head.requires_grad_(False)
+        if self.region_total_length is not None:
+            self.region_total_length.requires_grad_(False)
+        self._validate_catalog()
+        self.train(self.training)
 
     @property
     def device(self):
         return self.label_center.device
+
+    def train(self, mode=True):
+        """Train the spatial/task readout while keeping first-stage statistics fixed."""
+        super().train(mode)
+        self.backbone.eval()
+        self.head.eval()
+        self.peak_decoder.context.eval()
+        self.peak_decoder.calibration.eval()
+        self.peak_decoder.context_readout.eval()
+        self.peak_decoder.feature_reference.eval()
+        if self.region_total_length is not None:
+            self.region_total_length.eval()
+        return self
 
     def tracks_for(self, species: str, task: str | None = None) -> Tensor:
         """Return registry indices [K] for a species and optional Histone/OCR/TF."""
@@ -89,7 +110,7 @@ class PhytoReg(nn.Module):
     def from_features(self, h: Tensor, track_indices: Tensor, *,
                       track_valid_mask: Tensor | None = None,
                       position_valid_mask: Tensor | None = None) -> dict[str, Tensor]:
-        """Read central 32-bp features; masks affect pooling/profile, not DNA encoding."""
+        """Run both readout stages on central 32-bp features with known region masks."""
         if h.ndim != 3 or h.shape[-1] != self.config.head.hidden_dim or h.shape[1] == 0:
             raise ValueError('features must have shape [B,L,hidden_dim] with L > 0')
         if h.device != self.device or not h.is_floating_point():
@@ -100,14 +121,16 @@ class PhytoReg(nn.Module):
         if positions.dtype != torch.bool or positions.shape != h.shape[:2] or positions.device != h.device:
             raise ValueError('position_valid_mask must be boolean [B,L] on the model device')
         with torch.autocast(device_type=h.device.type, enabled=False):
-            p = self.head(h.float(), indices, valid, positions)
-            signal = ((p['signal_z'] - self.label_center[indices][:, None])
-                      / self.label_scale[indices][:, None]) * valid[:, None]
-            total = p['window_total_z']
-            if self.region_total_length is not None:
-                total = (total + self.region_total_length(
-                    torch.log1p(positions.sum(1, keepdim=True).float()))) * valid
-            return dict(signal_z=signal, peak_logits=p['peak_logits'],
+            with torch.no_grad():
+                p = self.head(h.detach().float(), indices, valid, positions)
+                signal = ((p['signal_z'] - self.label_center[indices][:, None])
+                          / self.label_scale[indices][:, None]) * valid[:, None]
+                total = p['window_total_z']
+                if self.region_total_length is not None:
+                    total = (total + self.region_total_length(
+                        torch.log1p(positions.sum(1, keepdim=True).float()))) * valid
+            peak = self.peak_decoder(h.detach().float(), p['peak_logits'], signal, indices, valid, positions)
+            return dict(signal_z=signal, peak_logits=peak,
                         profile_logits=p['profile_logits'], total_z=total,
                         profile_score=p['signal_profile_score'])
 
@@ -123,7 +146,8 @@ class PhytoReg(nn.Module):
             if torch.any((dna < 0) | (dna > 4)):
                 raise ValueError('DNA tokens must be in [0,4]')
             dna = F.one_hot(dna.long(), num_classes=5).float()
-        features = self.backbone.forward_features(dna)['regulatory_32bp']
+        with torch.no_grad():
+            features = self.backbone.forward_features(dna)['regulatory_32bp']
         return self.from_features(features, track_indices, track_valid_mask=track_valid_mask,
                                   position_valid_mask=position_valid_mask)
 
@@ -168,7 +192,8 @@ class PhytoReg(nn.Module):
                 lookup[indices].sort().values, torch.arange(config.head.num_tracks)):
             raise ValueError('Invalid registry-to-head mapping in checkpoint')
         indices = indices[lookup[indices].argsort()]
-        model = cls(config, indices, state['head.normalization_group'])
+        catalog = json.loads((directory / 'tracks.json').read_text(encoding='utf-8'))
+        model = cls(config, indices, state['head.normalization_group'], track_catalog=catalog)
         model.load_state_dict(state, strict=True)
         active = model.head.lookup >= 0
         if not torch.isfinite(model.label_center[active]).all() or not torch.all(
@@ -178,7 +203,6 @@ class PhytoReg(nn.Module):
             raise ValueError('Invalid feature normalization')
         model.metadata = json.loads((directory / 'metadata.json').read_text(encoding='utf-8'))
         model.metadata.update(model_name='PhytoReg', loaded_weights_sha256=actual)
-        model.track_catalog = json.loads((directory / 'tracks.json').read_text(encoding='utf-8'))
         model._validate_catalog()
         return model.to(device).eval()
 
@@ -196,6 +220,23 @@ class PhytoReg(nn.Module):
         if (any(len(groups) != 1 for groups in groups_by_species.values())
                 or len({next(iter(g)) for g in groups_by_species.values()}) != len(groups_by_species)):
             raise ValueError('Track catalog species disagree with normalization groups')
+        for row in self.track_catalog:
+            index = row['registry_index']
+            condition = row.get('spatial_condition_index', 0)
+            if (row['task_group'] not in TASKS or not 0 <= condition < self.config.spatial.num_conditions
+                    or int(self.peak_decoder.tasks[index]) != TASKS.index(row['task_group'])
+                    or int(self.peak_decoder.conditions[index]) != condition
+                    or bool(self.peak_decoder.enabled[index]) != row.get('peak_enabled', True)):
+                raise ValueError('Track catalog disagrees with spatial readout metadata')
+        tf_ids = [r['registry_index'] for r in self.track_catalog if r['task_group'] == 'TF']
+        if sorted(self.peak_decoder.tf_lookup[tf_ids].tolist()) != list(range(len(tf_ids))):
+            raise ValueError('Invalid TF feature readout mapping')
+        for name in ('context_gain', 'readout_gain'):
+            gain = getattr(self.peak_decoder, name)
+            if not torch.all(torch.isfinite(gain) & (gain >= 0) & (gain <= 1)):
+                raise ValueError('Invalid spatial calibration coefficients')
+        if not torch.all(torch.isfinite(self.peak_decoder.input_std) & (self.peak_decoder.input_std > 0)):
+            raise ValueError('Invalid spatial input normalization')
 
     def save_pretrained(self, directory):
         """Save the PhytoReg format without optimizer state; never overwrite."""

@@ -1,4 +1,4 @@
-"""Behavioral checks for independent outputs, input masks and checkpoint loading."""
+"""Behavioral checks for two-stage predictions, frozen first stage and bundles."""
 import json
 from pathlib import Path
 import tempfile
@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 import torch
-from phytoreg import PhytoReg, BackboneConfig, HeadConfig, PhytoRegConfig
+from phytoreg import PhytoReg, BackboneConfig, HeadConfig, PhytoRegConfig, SpatialConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,9 +18,13 @@ def small_model():
         token_embed_dim=8, conv_init_embed_dim=8, encoder_channels=(12,16,20,24,28,30,32),
         transformer_dim=32, transformer_layers=2, transformer_heads=4, transformer_ffn_dim=64,
         gradient_checkpointing=False)
-    config = PhytoRegConfig(backbone, HeadConfig(8, 4, 4, 7, 2))
+    config = PhytoRegConfig(backbone, HeadConfig(8, 4, 4, 7, 2), spatial=SpatialConfig(4, 4, 3))
     torch.manual_seed(17)
-    model = PhytoReg(config, [1, 2, 4, 6], [0, 0, 1, 1])
+    catalog = [dict(registry_index=i, head_row=row, species_id=sp, task_group=task,
+                    peak_enabled=True, spatial_condition_index=condition)
+        for row, (i, sp, task, condition) in enumerate([
+            (1, 'a', 'Histone', 0), (2, 'a', 'OCR', 1), (4, 'b', 'TF', 2), (6, 'b', 'OCR', 1)])]
+    model = PhytoReg(config, [1, 2, 4, 6], [0, 0, 1, 1], track_catalog=catalog)
     with torch.no_grad():
         for name, parameter in model.head.named_parameters():
             if name.startswith(('weights.', 'biases.', 'signal_delta')):
@@ -29,8 +33,10 @@ def small_model():
         model.head.feature_std.uniform_(.8, 1.2)
         model.label_center.normal_(0, .2)
         model.label_scale.uniform_(.8, 1.2)
-    model.track_catalog = [dict(registry_index=i, head_row=row, species_id=sp, task_group='Histone')
-                           for row, (i, sp) in enumerate([(1, 'a'), (2, 'a'), (4, 'b'), (6, 'b')])]
+        model.peak_decoder.spatial.readout_weight.normal_(0, .03)
+        model.peak_decoder.task_readout.weight.normal_(0, .03)
+        model.peak_decoder.context_gain.copy_(torch.tensor([1., 1., .75]))
+        model.peak_decoder.readout_gain.copy_(torch.tensor([1., .9, .9]))
     return model
 
 
@@ -39,7 +45,7 @@ class PhytoRegTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
 
-    def test_native_and_token_dna_are_equal_and_all_heads_train(self):
+    def test_native_and_token_dna_are_equal_and_peak_uses_both_stages(self):
         model = small_model().eval()
         dna = torch.randint(0, 5, (2, 1024)); tracks = torch.tensor([[1, 2], [4, 6]])
         a = model(dna, tracks); b = model(torch.nn.functional.one_hot(dna, 5).float(), tracks)
@@ -47,10 +53,9 @@ class PhytoRegTests(unittest.TestCase):
         self.assertEqual(a['signal_z'].shape, (2, 16, 2))
         self.assertEqual(a['total_z'].shape, (2, 2))
         sum(a[k].square().mean() for k in ['signal_z', 'peak_logits', 'profile_logits', 'total_z']).backward()
-        self.assertGreater(model.backbone.base_embedding.weight.grad.abs().sum().item(), 0)
-        for name in ('signal', 'peak', 'profile', 'total'):
-            self.assertGreater(model.head.weights[name].grad.abs().sum().item(), 0)
-            self.assertGreater(model.head.projections[name][1].weight.grad.abs().sum().item(), 0)
+        self.assertTrue(all(p.grad is None and not p.requires_grad for p in model.backbone.parameters()))
+        self.assertTrue(all(p.grad is None and not p.requires_grad for p in model.head.parameters()))
+        self.assertGreater(model.peak_decoder.spatial.stem.weight.grad.abs().sum().item(), 0)
         self.assertFalse(any('query' in name or 'lm_head' in name for name, _ in model.named_modules()))
 
     def test_masked_padding_order_and_empty_region(self):
@@ -59,7 +64,8 @@ class PhytoRegTests(unittest.TestCase):
         padded = model.from_features(h, torch.tensor([[1, 9999, -1, 2]]),
                                      track_valid_mask=torch.tensor([[True, False, False, True]]))
         for key, value in base.items():
-            torch.testing.assert_close(padded[key][..., [3, 0]], value, rtol=0, atol=0)
+            torch.testing.assert_close(padded[key][..., [3, 0]], value, rtol=2e-5 if key == 'peak_logits' else 0,
+                                       atol=2e-6 if key == 'peak_logits' else 0)
             self.assertTrue((padded[key][..., 1:3] == 0).all())
         empty = model.from_features(h, tracks, position_valid_mask=torch.zeros(1, 7, dtype=torch.bool))
         self.assertTrue((empty['profile_score'] == 0).all())
@@ -96,19 +102,48 @@ class PhytoRegTests(unittest.TestCase):
             with (directory / 'model.pt').open('ab') as handle: handle.write(b'bad')
             with self.assertRaisesRegex(ValueError, 'checksum'): PhytoReg.from_pretrained(directory)
 
-    def test_training_checkpointing_preserves_predictions(self):
-        from dataclasses import replace
+    def test_training_updates_spatial_readout_and_preserves_first_stage_outputs(self):
         model = small_model().train()
-        checkpointed = small_model().train()
-        checkpointed.backbone.config = replace(checkpointed.config.backbone, gradient_checkpointing=True)
-        dna = torch.randint(0, 5, (1, 1024)); tracks = torch.tensor([[1, 2]])
-        a = model(dna, tracks); b = checkpointed(dna, tracks)
-        for key in a: torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
-        sum(v.square().mean() for v in a.values()).backward()
-        sum(v.square().mean() for v in b.values()).backward()
-        for (name, p), (_, q) in zip(model.named_parameters(), checkpointed.named_parameters()):
-            if p.grad is not None:
-                torch.testing.assert_close(p.grad, q.grad, rtol=0, atol=0, msg=name)
+        self.assertFalse(model.backbone.training)
+        self.assertFalse(model.head.training)
+        source = {k:v.clone() for k,v in model.state_dict().items() if not k.startswith('peak_decoder.')}
+        h = torch.randn(2, 65, 8, requires_grad=True); tracks = torch.tensor([[1, 2], [4, 6]])
+        before = model.from_features(h, tracks)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=.01)
+        before['peak_logits'].square().mean().backward();optimizer.step()
+        self.assertIsNone(h.grad)
+        self.assertGreater(model.peak_decoder.task_readout.weight.grad.abs().sum().item(), 0)
+        self.assertTrue(all(p.grad is None for p in model.peak_decoder.context.parameters()))
+        after = model.from_features(h, tracks)
+        self.assertFalse(torch.equal(before['peak_logits'], after['peak_logits']))
+        for key in ('signal_z', 'profile_logits', 'profile_score', 'total_z'):
+            torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
+        for key, value in source.items():
+            torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
+
+    def test_shared_pathway_receives_each_task_and_readout_is_task_specific(self):
+        for track, task in [(1, 0), (2, 1), (4, 2)]:
+            model = small_model().train()
+            value = model.from_features(torch.randn(1, 65, 8), torch.tensor([[track]]))['peak_logits']
+            value.square().mean().backward()
+            self.assertGreater(model.peak_decoder.spatial.stem.weight.grad.abs().sum().item(), 0)
+            grad = model.peak_decoder.spatial.readout_weight.grad
+            self.assertGreater(grad[task].abs().sum().item(), 0)
+            self.assertTrue((grad[torch.arange(3) != task] == 0).all())
+
+    def test_masks_locality_reversal_and_disabled_peaks(self):
+        model = small_model().eval(); h = torch.randn(1, 65, 8); ids = torch.tensor([[1, 2]])
+        region = torch.ones(1, 65, dtype=torch.bool);region[:, 25:35] = False
+        value = model.from_features(h, ids, position_valid_mask=region)['peak_logits']
+        raw = model.head(h, ids, positions=region)['peak_logits']
+        self.assertTrue(torch.equal(value[:, ~region[0]], raw[:, ~region[0]]))
+        reverse = model.from_features(h.flip(1), ids, position_valid_mask=region.flip(1))['peak_logits'].flip(1)
+        torch.testing.assert_close(value, reverse, atol=3e-6, rtol=3e-5)
+        chunks = torch.cat([model.from_features(h, ids[:, i:i+1], position_valid_mask=region)['peak_logits'] for i in range(2)], -1)
+        torch.testing.assert_close(value, chunks, atol=3e-6, rtol=3e-5)
+        model.peak_decoder.enabled[1] = False
+        disabled = model.from_features(h, ids, position_valid_mask=region)['peak_logits']
+        self.assertTrue(torch.equal(disabled[:, :, 0], raw[:, :, 0]))
 
     def test_cli_and_only_supported_format(self):
         import numpy as np
