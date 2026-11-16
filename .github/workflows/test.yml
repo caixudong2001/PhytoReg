@@ -35,5 +35,5 @@ jobs:
           python -m pip uninstall -y phytoreg
           python -m pip install --no-deps dist/*.whl
           cd "$RUNNER_TEMP"
-          python -c "import phytoreg; assert phytoreg.__version__ == '0.2.0'; assert phytoreg.PhytoReg.model_name == 'PhytoReg'"
+          python -c "import phytoreg; assert phytoreg.__version__ == '1.0.1'; assert phytoreg.PhytoReg.model_name == 'PhytoReg'"
           phytoreg --help

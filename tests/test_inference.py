@@ -1,6 +1,8 @@
 """Coordinate, mask, batching and complete CLI regression tests."""
+from contextlib import redirect_stderr, redirect_stdout
 import csv
 import gzip
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from phytoreg.cli import main
 from phytoreg.genome import (FastaReference, IntervalIndex, Region, count_windows, encode_dna,
                             plan_windows, read_bed, window_arrays)
 from phytoreg.inference import predict_genome, predict_npz, select_tracks
@@ -166,6 +169,28 @@ class PredictionTests(unittest.TestCase):
             self.assertAlmostEqual(float(rows[0]['profile_probability']),float(expected[0,2,0]),places=6)
             self.assertAlmostEqual(float(totals[0]['total_z']),float(pred['total_z'][0,0]),places=6)
 
+    def test_disabled_peak_is_unavailable_in_genomic_exports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fasta, bed = self._inputs(directory)
+            model = model_fixture()
+            model.track_catalog[0]['peak_enabled'] = False
+            model.peak_decoder.enabled[1] = False
+            output = directory / 'output'
+            predict_genome(model, fasta=fasta, bed=bed, output=output, species='a',
+                           output_format='both', quiet=True)
+            rows = table(output / 'predictions.tsv.gz')
+            disabled = [row for row in rows if row['track_id'] == 'a_1']
+            enabled = [row for row in rows if row['track_id'] == 'a_2']
+            self.assertTrue(disabled and enabled)
+            for row in disabled:
+                self.assertEqual((row['peak_logit'], row['peak_probability']), ('NA', 'NA'))
+                self.assertTrue(np.isfinite(float(row['signal_registry'])))
+            self.assertTrue(all(np.isfinite(float(row['peak_probability'])) for row in enabled))
+            peaks = (output / 'bedgraph').glob('*.peak_probability.bedGraph.gz')
+            self.assertEqual([path.name for path in peaks], ['track_00002.peak_probability.bedGraph.gz'])
+            self.assertTrue((output / 'bedgraph/track_00001.signal_registry.bedGraph.gz').is_file())
+
     def test_empty_valid_window_and_full_reference_tail(self):
         with tempfile.TemporaryDirectory() as temp:
             directory=Path(temp);fasta,bed=self._inputs(directory);model=model_fixture()
@@ -227,6 +252,70 @@ class PredictionTests(unittest.TestCase):
             self.assertTrue(all(r['track_id']=='a_2' for r in table(out/'predictions.tsv.gz')))
             proc=subprocess.run(base+['predict',str(bundle),'--fasta',str(fasta),'--output',str(directory/'missing')],env=env,capture_output=True,text=True)
             self.assertNotEqual(proc.returncode,0);self.assertIn('--species is required',proc.stderr)
+
+    def test_cli_region_matches_bed_across_a_window_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fasta, bed = self._inputs(directory)
+            bed.write_text('chrA\t500\t530\n')
+            bundle = directory / 'model'
+            model_fixture().save_pretrained(bundle)
+            base = ['predict', str(bundle), '--fasta', str(fasta), '--species', 'a', '--quiet']
+            region_output = directory / 'region'
+            bed_output = directory / 'bed'
+            with redirect_stdout(StringIO()):
+                main(base + ['--region', 'chrA', '500', '530', '--output', str(region_output)])
+                main(base + ['--bed', str(bed), '--output', str(bed_output)])
+            rows = table(region_output / 'predictions.tsv.gz')
+            self.assertEqual(rows, table(bed_output / 'predictions.tsv.gz'))
+            self.assertEqual({(row['start'], row['requested_bp']) for row in rows},
+                             {('480', '12'), ('512', '18')})
+            status = json.loads((region_output / 'run.json').read_text())
+            self.assertEqual(status['region'], {'chrom': 'chrA', 'start': 500, 'end': 530})
+
+    def test_cli_dry_run_needs_only_metadata_and_counts_outputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fasta, bed = self._inputs(directory)
+            model = model_fixture()
+            model.track_catalog[0]['peak_enabled'] = False
+            model.peak_decoder.enabled[1] = False
+            bundle = directory / 'metadata'
+            bundle.mkdir()
+            (bundle / 'config.json').write_text(json.dumps(model.config.to_dict()))
+            (bundle / 'tracks.json').write_text(json.dumps(model.track_catalog))
+            base = ['predict', str(bundle), '--fasta', str(fasta), '--species', 'a', '--dry-run']
+            output = directory / 'output'
+            with patch('phytoreg.genome.tempfile.TemporaryFile', side_effect=AssertionError('created a FASTA store')):
+                with redirect_stdout(StringIO()) as stdout:
+                    main(base + ['--bed', str(bed), '--format', 'both', '--output', str(output), '--device', 'cuda'])
+                self.assertFalse(output.exists())
+                plan = json.loads(stdout.getvalue())
+                with redirect_stdout(StringIO()) as stdout:
+                    main(base + ['--region', 'chrB', '32', '33', '--track-id', 'a_2'])
+                region = json.loads(stdout.getvalue())
+
+            self.assertEqual(plan['status'], 'PLANNED')
+            self.assertEqual(plan['tracks'], ['a_1', 'a_2'])
+            self.assertEqual((region['windows_planned'], region['bins_planned'], region['prediction_rows']), (1, 1, 1))
+            predict_genome(model, fasta=fasta, output=output, species='a', bed=bed, output_format='both', quiet=True)
+            self.assertEqual(plan['windows_planned'], len(table(output / 'windows.tsv')))
+            self.assertEqual(plan['bins_planned'], 20)
+            self.assertEqual(plan['prediction_rows'], len(table(output / 'predictions.tsv.gz')))
+            self.assertEqual(plan['total_rows'], len(table(output / 'totals.tsv.gz')))
+            self.assertEqual(plan['bedgraph_rows_upper_bound'], 100)
+
+            invalid = [(['--region', 'chrA', '20', '1101'], 'interval must lie within'),
+                       (['--region', 'missing', '20', '30'], 'absent from FASTA'),
+                       (['--region', 'chrA', 'abc', '30'], 'coordinates must be integers'),
+                       (['--region', 'chrA', '20', '30', '--bed', str(bed)], 'not allowed with argument'),
+                       (['--region', 'chrA', '20', '30', '--region', 'chrA', '40', '50'], 'accepts one interval')]
+            for options, message in invalid:
+                with self.subTest(options=options), redirect_stderr(StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as exc:
+                        main(base + options)
+                    self.assertEqual(exc.exception.code, 2)
+                    self.assertIn(message, stderr.getvalue())
 
 
 if __name__ == '__main__':

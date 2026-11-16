@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phytoreg"
-version = "0.2.0"
+version = "1.0.1"
 description = "Two-stage plant regulatory model with a shared spatial pathway and task-adaptive readouts"
 readme = "README.md"
 license = {file = "LICENSE"}

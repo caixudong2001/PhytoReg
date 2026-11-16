@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from itertools import islice
+import json
 from pathlib import Path
 import sys
 import time
@@ -9,15 +10,20 @@ import time
 import numpy as np
 import torch
 
-from .genome import (FastaReference, IntervalIndex, Region, count_windows, encode_dna,
-                     open_text, plan_windows, read_bed, window_arrays)
+from .config import PhytoRegConfig
+from .genome import (BIN_SIZE_BP, FastaReference, IntervalIndex, Region, count_windows, encode_dna,
+                     open_text, parse_region, plan_windows, read_bed, window_arrays)
 from .model import file_sha256
 from .prediction_output import PredictionWriter, write_json
 
 
 def select_tracks(model, species=None, tasks=None, track_ids=None):
+    return _select_tracks(model.track_catalog, species, tasks, track_ids)
+
+
+def _select_tracks(records, species, tasks, track_ids):
     catalog = []
-    for original in model.track_catalog:
+    for original in records:
         record = dict(original)
         record.setdefault('track_id', str(record['registry_index']))
         catalog.append(record)
@@ -50,7 +56,43 @@ def _batches(items, size):
         yield batch
 
 
-def predict_genome(model, *, fasta, output, species, bed=None, valid_bed=None, tasks=None,
+def _requested_regions(sizes, bed, region):
+    if region is not None:
+        if bed is not None:
+            raise ValueError('--bed and --region are mutually exclusive')
+        return [parse_region(*region, sizes=sizes, source='--region')]
+    if bed is not None:
+        return read_bed(bed, sizes)
+    return [Region(chrom, 0, length) for chrom, length in sizes.items()]
+
+
+def plan_genome(model_directory, *, fasta, species, bed=None, region=None, valid_bed=None,
+                tasks=None, track_ids=None, output_format='tsv'):
+    """Count genomic outputs using the model configuration and track catalog."""
+    directory = Path(model_directory)
+    config = PhytoRegConfig.from_json(directory / 'config.json')
+    records = json.loads((directory / 'tracks.json').read_text(encoding='utf-8'))
+    required = {'registry_index', 'species_id', 'task_group'}
+    if not isinstance(records, list) or any(not isinstance(row, dict) or required - row.keys() for row in records):
+        raise ValueError('Invalid tracks.json catalog')
+    tracks = _select_tracks(records, species, tasks, track_ids)
+    with FastaReference(fasta, store_bases=False) as reference:
+        sizes = reference.sizes
+        requests = IntervalIndex(_requested_regions(sizes, bed, region))
+        if valid_bed is not None:
+            read_bed(valid_bed, sizes)
+    windows = count_windows(requests, config.backbone.downstream_output_length_bp)
+    bins = count_windows(requests, BIN_SIZE_BP)
+    peak_tracks = sum(bool(row.get('peak_enabled', True)) for row in tracks)
+    return dict(status='PLANNED', species=species, tracks=[row['track_id'] for row in tracks],
+                output_format=output_format, windows_planned=windows, bins_planned=bins,
+                prediction_rows=bins * len(tracks) if output_format in ('tsv', 'both') else 0,
+                total_rows=windows * len(tracks),
+                bedgraph_rows_upper_bound=(bins * (2 * len(tracks) + peak_tracks)
+                                           if output_format in ('bedgraph', 'both') else 0))
+
+
+def predict_genome(model, *, fasta, output, species, bed=None, region=None, valid_bed=None, tasks=None,
                    track_ids=None, batch_size=1, output_format='tsv', temp_dir=None, quiet=False):
     if batch_size < 1:
         raise ValueError('batch_size must be positive')
@@ -66,7 +108,7 @@ def predict_genome(model, *, fasta, output, species, bed=None, valid_bed=None, t
     started = time.monotonic()
     with FastaReference(fasta, temp_dir) as reference:
         sizes = reference.sizes
-        regions = read_bed(bed, sizes) if bed is not None else [Region(c, 0, n) for c, n in sizes.items()]
+        regions = _requested_regions(sizes, bed, region)
         requests = IntervalIndex(regions)
         valid_regions = IntervalIndex(read_bed(valid_bed, sizes)) if valid_bed is not None else None
         total_windows = count_windows(requests, output_length)
@@ -74,7 +116,7 @@ def predict_genome(model, *, fasta, output, species, bed=None, valid_bed=None, t
                       for name, path in [('fasta', fasta), ('bed', bed), ('valid_bed', valid_bed)] if path is not None}
         status = dict(status='RUNNING', model='PhytoReg', model_sha256=model.metadata.get('loaded_weights_sha256'),
             inputs=provenance, species=species, tracks=[r['track_id'] for r in tracks],
-            input_length_bp=input_length, output_length_bp=output_length, bin_size_bp=32,
+            input_length_bp=input_length, output_length_bp=output_length, bin_size_bp=BIN_SIZE_BP,
             coordinates='zero-based half-open; reference-forward; contig-origin grid',
             bed_selection='emit complete 32-bp bins intersecting the union of requested intervals; clip at contig end',
             position_mask='bins fully covered by valid_bed' if valid_bed else 'bins overlapping real reference sequence',
@@ -85,6 +127,9 @@ def predict_genome(model, *, fasta, output, species, bed=None, valid_bed=None, t
             ambiguous_iupac_bases_mapped_to_N=reference.ambiguous_bases,
             batch_size=batch_size, device=str(model.device), precision='float32', output_format=output_format,
             windows_planned=total_windows, windows_completed=0, emitted_bins=0)
+        if region is not None:
+            requested = regions[0]
+            status['region'] = dict(chrom=requested.chrom, start=requested.start, end=requested.end)
         directory.mkdir(parents=True, exist_ok=False)
         write_json(directory / 'run.json', status)
         model.eval()

@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 
-from .inference import predict_genome, predict_npz, read_track_ids, select_tracks
+from .inference import plan_genome, predict_genome, predict_npz, read_track_ids, select_tracks
 from .model import PhytoReg
 from .prediction_output import write_tracks
 
@@ -31,27 +31,44 @@ def main(argv=None):
             source = command.add_mutually_exclusive_group(required=True)
             source.add_argument('--input', type=Path, help='NPZ with dna and track_indices')
             source.add_argument('--fasta', type=Path, help='Reference FASTA or FASTA.gz')
-            command.add_argument('--bed', type=Path, help='BED3-6 requested regions; default: entire FASTA')
+            regions = command.add_mutually_exclusive_group()
+            regions.add_argument('--bed', type=Path, help='BED3-6 requested regions; default: entire FASTA')
+            regions.add_argument('--region', action='append', nargs=3, metavar=('CHROM', 'START', 'END'),
+                                 help='Single zero-based half-open interval')
             command.add_argument('--valid-bed', type=Path, help='BED3-6 defining peak context and profile/total positions')
             selection = command.add_mutually_exclusive_group()
             selection.add_argument('--track-id', action='append', help='Track ID to predict; repeat for multiple tracks')
             selection.add_argument('--tracks-file', type=Path, help='One track ID per line')
-            command.add_argument('--output', type=Path, required=True, help='New directory for FASTA, new NPZ file for NPZ input')
+            command.add_argument('--output', type=Path, help='New result path, required for predictions')
+            command.add_argument('--dry-run', action='store_true', help='Preview FASTA outputs without loading weights')
             command.add_argument('--device', default='cpu')
             command.add_argument('--batch-size', type=_positive, default=1)
             command.add_argument('--format', choices=['tsv', 'bedgraph', 'both'], default='tsv', help='FASTA output format')
             command.add_argument('--temp-dir', type=Path, help='Temporary FASTA storage directory')
             command.add_argument('--quiet', action='store_true')
     args = parser.parse_args(argv)
-    if getattr(args, 'output', None) is not None and args.output.exists():
-        parser.error('Output already exists; choose a new path')
     if args.command == 'predict':
         if args.fasta is not None and not args.species:
             parser.error('--species is required with --fasta; use phytoreg inspect to list species')
-        if args.input is not None and (args.bed or args.valid_bed or args.species or args.task
-                or args.track_id or args.tracks_file or args.temp_dir or args.format != 'tsv'):
-            parser.error('--bed/--valid-bed/--species/--task/track selection/--format/--temp-dir require --fasta')
+        if args.input is not None and (args.bed or args.region or args.valid_bed or args.species or args.task
+                or args.track_id or args.tracks_file or args.temp_dir or args.dry_run or args.format != 'tsv'):
+            parser.error('--bed/--region/--valid-bed/--species/--task/track selection/--format/--temp-dir/--dry-run require --fasta')
+        if args.region and len(args.region) > 1:
+            parser.error('--region accepts one interval; use --bed for multiple intervals')
+        if not args.dry_run and args.output is None:
+            parser.error('--output is required for predictions')
+    if (getattr(args, 'output', None) is not None and not getattr(args, 'dry_run', False)
+            and args.output.exists()):
+        parser.error('Output already exists; choose a new path')
     try:
+        if args.command == 'predict' and args.fasta is not None:
+            track_ids = read_track_ids(args.tracks_file) if args.tracks_file else args.track_id
+            genome_options = dict(fasta=args.fasta, species=args.species, bed=args.bed,
+                                  region=args.region[0] if args.region else None, valid_bed=args.valid_bed,
+                                  tasks=args.task, track_ids=track_ids, output_format=args.format)
+            if args.dry_run:
+                print(json.dumps(plan_genome(args.model, **genome_options), indent=2))
+                return
         model = PhytoReg.from_pretrained(args.model, device=getattr(args, 'device', 'cpu'))
     except (OSError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
@@ -80,10 +97,8 @@ def main(argv=None):
             shapes = predict_npz(model, args.input, args.output, args.batch_size)
             print(json.dumps(dict(output=str(args.output), shapes=shapes)))
         else:
-            track_ids = read_track_ids(args.tracks_file) if args.tracks_file else args.track_id
-            result = predict_genome(model, fasta=args.fasta, output=args.output, species=args.species,
-                bed=args.bed, valid_bed=args.valid_bed, tasks=args.task, track_ids=track_ids,
-                batch_size=args.batch_size, output_format=args.format, temp_dir=args.temp_dir, quiet=args.quiet)
+            result = predict_genome(model, output=args.output, batch_size=args.batch_size,
+                                    temp_dir=args.temp_dir, quiet=args.quiet, **genome_options)
             print(json.dumps(dict(status=result['status'], output=str(args.output),
                 windows=result['windows_completed'], bins=result['emitted_bins'], tracks=len(result['tracks']))))
     except (OSError, ValueError, RuntimeError) as exc:

@@ -101,6 +101,7 @@ class PredictionWriter:
             max(0, input_end - window.chrom_length), valid_count, len(selected)])
         for track_number, track in enumerate(self.tracks):
             index, track_id = track['registry_index'], track['track_id']
+            peak_enabled = track.get('peak_enabled', True)
             # A total describes the entire model output window, not the requested BED subinterval.
             self.totals.writerow([window.identifier, window.chrom, window.start,
                 min(window.start + output_length, window.chrom_length), index, track_id,
@@ -108,12 +109,17 @@ class PredictionWriter:
             if self.bins is not None:
                 for i in selected:
                     self.bins.writerow([window.chrom, starts[i], ends[i], window.identifier, i, index, track_id,
-                        *[_number(values[k][i, track_number]) for k in (
-                            'signal_z', 'signal_registry', 'peak_logits', 'peak_probability',
-                            'profile_logits', 'profile_probability')],
+                        _number(values['signal_z'][i, track_number]),
+                        _number(values['signal_registry'][i, track_number]),
+                        _number(values['peak_logits'][i, track_number]) if peak_enabled else 'NA',
+                        _number(values['peak_probability'][i, track_number]) if peak_enabled else 'NA',
+                        _number(values['profile_logits'][i, track_number]),
+                        _number(values['profile_probability'][i, track_number]),
                         int(valid[i]), valid_bp[i], requested_bp[i]])
             if self.bedgraphs is not None:
                 for kind in ('signal_registry', 'peak_probability', 'profile_probability'):
+                    if kind == 'peak_probability' and not peak_enabled:
+                        continue
                     self.bedgraphs.write(index, kind, (
                         f'{window.chrom}\t{starts[i]}\t{ends[i]}\t{_number(values[kind][i, track_number])}\n'
                         for i in selected if kind != 'profile_probability' or valid[i]))

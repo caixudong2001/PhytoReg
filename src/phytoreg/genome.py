@@ -10,6 +10,9 @@ import tempfile
 import numpy as np
 
 
+BIN_SIZE_BP = 32
+
+
 def open_text(path):
     path = Path(path)
     return gzip.open(path, 'rt', encoding='utf-8') if path.suffix == '.gz' else path.open(encoding='utf-8')
@@ -17,11 +20,11 @@ def open_text(path):
 
 class FastaReference:
     """Normalize a FASTA into a temporary, seekable base store; never load a genome in RAM."""
-    def __init__(self, path, temp_dir=None):
+    def __init__(self, path, temp_dir=None, *, store_bases=True):
         self.path = Path(path)
         self.sequences = {}
         self.ambiguous_bases = 0
-        self._store = tempfile.TemporaryFile(dir=temp_dir)
+        self._store = tempfile.TemporaryFile(dir=temp_dir) if store_bases else None
         try:
             opener = gzip.open if self.path.suffix == '.gz' else open
             with opener(self.path, 'rb') as handle:
@@ -40,7 +43,8 @@ class FastaReference:
                         name = fields[0].decode('utf-8')
                         if name in self.sequences:
                             raise ValueError(f'Duplicate FASTA sequence identifier: {name}')
-                        self.sequences[name] = [self._store.tell(), 0]
+                        offset = self._store.tell() if self._store is not None else 0
+                        self.sequences[name] = [offset, 0]
                     else:
                         bases = part.translate(None, b' \t\r\n').upper()
                         if bases:
@@ -49,13 +53,14 @@ class FastaReference:
                             if bases.translate(None, b'ACGTNRYSWKMBDHV'):
                                 raise ValueError(f'Invalid DNA character in FASTA sequence {name}')
                             self.ambiguous_bases += len(bases.translate(None, b'ACGTN'))
-                            bases = bases.translate(bytes.maketrans(b'RYSWKMBDHV', b'NNNNNNNNNN'))
-                            self._store.write(bases)
+                            if self._store is not None:
+                                self._store.write(bases.translate(bytes.maketrans(b'RYSWKMBDHV', b'NNNNNNNNNN')))
                             self.sequences[name][1] += len(bases)
                     at_line_start = part.endswith(b'\n')
             if not self.sequences or any(length == 0 for _, length in self.sequences.values()):
                 raise ValueError('FASTA must contain nonempty sequences')
-            self._store.flush()
+            if self._store is not None:
+                self._store.flush()
         except BaseException:
             self.close()
             raise
@@ -66,6 +71,8 @@ class FastaReference:
 
     def fetch(self, chrom, start, end):
         """Fetch reference-forward bases; pad missing context with N."""
+        if self._store is None:
+            raise ValueError('Reference was opened without storing bases')
         if end < start:
             raise ValueError('FASTA fetch end precedes start')
         offset, length = self.sequences[chrom]
@@ -77,7 +84,8 @@ class FastaReference:
         return b'N' * left + sequence + b'N' * right
 
     def close(self):
-        self._store.close()
+        if self._store is not None:
+            self._store.close()
 
     def __enter__(self):
         return self
@@ -95,6 +103,20 @@ class Region:
     strand: str = '.'
 
 
+def parse_region(chrom, start, end, *, sizes, source, name='.', strand='.'):
+    try:
+        start, end = int(start), int(end)
+    except ValueError as exc:
+        raise ValueError(f'{source}: coordinates must be integers') from exc
+    if chrom not in sizes:
+        raise ValueError(f'{source}: {chrom} is absent from FASTA')
+    if not 0 <= start < end <= sizes[chrom]:
+        raise ValueError(f'{source}: interval must lie within {chrom} [0,{sizes[chrom]})')
+    if strand not in ('.', '+', '-'):
+        raise ValueError(f'{source}: invalid strand')
+    return Region(chrom, start, end, name, strand)
+
+
 def read_bed(path, sizes):
     """Read BED3-6 in zero-based half-open coordinates, validating every interval."""
     regions = []
@@ -106,19 +128,10 @@ def read_bed(path, sizes):
             fields = text.split()
             if not 3 <= len(fields) <= 6:
                 raise ValueError(f'BED line {line_number}: expected 3 to 6 fields')
-            chrom = fields[0]
-            try:
-                start, end = int(fields[1]), int(fields[2])
-            except ValueError as exc:
-                raise ValueError(f'BED line {line_number}: coordinates must be integers') from exc
-            if chrom not in sizes:
-                raise ValueError(f'BED line {line_number}: {chrom} is absent from FASTA')
-            if not 0 <= start < end <= sizes[chrom]:
-                raise ValueError(f'BED line {line_number}: interval must lie within {chrom} [0,{sizes[chrom]})')
+            name = fields[3] if len(fields) >= 4 else '.'
             strand = fields[5] if len(fields) == 6 else '.'
-            if strand not in ('.', '+', '-'):
-                raise ValueError(f'BED line {line_number}: invalid strand')
-            regions.append(Region(chrom, start, end, fields[3] if len(fields) >= 4 else '.', strand))
+            regions.append(parse_region(*fields[:3], sizes=sizes, source=f'BED line {line_number}',
+                                        name=name, strand=strand))
     if not regions:
         raise ValueError('BED contains no intervals')
     return regions
@@ -193,8 +206,8 @@ def count_windows(requests, output_length):
 
 
 def window_arrays(window, output_length, requests, valid_regions=None):
-    starts = window.start + np.arange(output_length // 32, dtype=np.int64) * 32
-    ends = np.minimum(starts + 32, window.chrom_length)
+    starts = window.start + np.arange(output_length // BIN_SIZE_BP, dtype=np.int64) * BIN_SIZE_BP
+    ends = np.minimum(starts + BIN_SIZE_BP, window.chrom_length)
     # For wholly padded bins, use zero-length intervals instead of inverted coordinates.
     ends = np.maximum(starts, ends)
     valid_bp = ends - starts
